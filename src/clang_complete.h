@@ -13,7 +13,7 @@
 #include <mutex>
 #include <string>
 
-struct CompletionSession {
+struct CompletionSession : public std::enable_shared_from_this<CompletionSession> {
   Project::Entry file;
   WorkingFiles* working_files;
   clang::Index index;
@@ -48,8 +48,8 @@ struct LruSessionCache {
 
 struct ClangCompleteManager {
   using OnDiagnostic = std::function<void(std::string path, NonElidedVector<lsDiagnostic> diagnostics)>;
-  using OnComplete = std::function<void(NonElidedVector<lsCompletionItem> results)>;
-  
+  using OnComplete = std::function<void(const NonElidedVector<lsCompletionItem>& results, bool is_cached_result)>;
+
   struct ParseRequest {
     ParseRequest(const std::string& path);
 
@@ -62,6 +62,7 @@ struct ClangCompleteManager {
   };
 
   ClangCompleteManager(Config* config, Project* project, WorkingFiles* working_files, OnDiagnostic on_diagnostic);
+  ~ClangCompleteManager();
 
   // Start a code completion at the given location. |on_complete| will run when
   // completion results are available. |on_complete| may run on any thread.
@@ -80,8 +81,8 @@ struct ClangCompleteManager {
   std::shared_ptr<CompletionSession> TryGetSession(const std::string& filename, bool create_if_needed);
 
   // TODO: make these configurable.
-  const int kMaxViewSessions = 3;
-  const int kMaxEditSessions = 10;
+  const int kMaxViewSessions = 1;
+  const int kMaxEditSessions = 1;
 
   // Global state.
   Config* config_;

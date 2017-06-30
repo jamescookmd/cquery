@@ -80,13 +80,22 @@ const int kExpectedClientVersion = 3;
 // the user erases a character. vscode will resend the completion request if
 // that happens.
 struct CodeCompleteCache {
-  optional<std::string> cached_path;
-  optional<lsPosition> cached_completion_position;
-  NonElidedVector<lsCompletionItem> cached_results;
+  // NOTE: Make sure to access these variables under |WithLock|.
+  optional<std::string> cached_path_;
+  optional<lsPosition> cached_completion_position_;
+  NonElidedVector<lsCompletionItem> cached_results_;
 
-  bool IsCacheValid(lsTextDocumentPositionParams position) const {
-    return cached_path == position.textDocument.uri.GetPath() &&
-            cached_completion_position == position.position;
+  std::mutex mutex_;
+
+  void WithLock(std::function<void()> action) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    action();
+  }
+
+  bool IsCacheValid(lsTextDocumentPositionParams position) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cached_path_ == position.textDocument.uri.GetPath() &&
+           cached_completion_position_ == position.position;
   }
 };
 
@@ -258,18 +267,20 @@ optional<int> FindIncludeLine(const std::vector<std::string>& lines, const std::
   return 0;
 }
 
-optional<QueryFileId> GetImplementationFile(QueryDatabase* db, QueryFile* file) {
+optional<QueryFileId> GetImplementationFile(QueryDatabase* db, QueryFileId file_id, QueryFile* file) {
   for (SymbolRef sym : file->def.outline) {
     switch (sym.idx.kind) {
       case SymbolKind::Func: {
         optional<QueryFunc>& func = db->funcs[sym.idx.idx];
-        if (func && func->def.definition_extent)
+        // Note: we ignore the definition if it is in the same file (ie, possibly a header).
+        if (func && func->def.definition_extent && func->def.definition_extent->path != file_id)
           return func->def.definition_extent->path;
         break;
       }
       case SymbolKind::Var: {
         optional<QueryVar>& var = db->vars[sym.idx.idx];
-        if (var && var->def.definition_extent)
+        // Note: we ignore the definition if it is in the same file (ie, possibly a header).
+        if (var && var->def.definition_extent && var->def.definition_extent->path != file_id)
           return db->vars[sym.idx.idx]->def.definition_extent->path;
         break;
       }
@@ -286,6 +297,8 @@ optional<QueryFileId> GetImplementationFile(QueryDatabase* db, QueryFile* file) 
   if (last != std::string::npos) {
     target_path = target_path.substr(0, last);
   }
+
+  std::cerr << "!! Looking for impl file that starts with " << target_path << std::endl;
 
   for (auto& entry : db->usr_to_file) {
     Usr path = entry.first;
@@ -308,7 +321,7 @@ void EnsureImplFile(QueryDatabase* db, QueryFileId file_id, optional<lsDocumentU
     optional<QueryFile>& file = db->files[file_id.id];
     assert(file);
 
-    impl_file_id = GetImplementationFile(db, &file.value());
+    impl_file_id = GetImplementationFile(db, file_id, &file.value());
     if (!impl_file_id.has_value())
       impl_file_id = file_id;
 
@@ -473,12 +486,35 @@ void FilterCompletionResponse(Out_TextDocumentComplete* complete_response,
     else {
       NonElidedVector<lsCompletionItem> filtered_result;
       filtered_result.reserve(kMaxResultSize);
+
+      std::unordered_set<std::string> inserted;
+      inserted.reserve(kMaxResultSize);
+
       for (const lsCompletionItem& item : complete_response->result.items) {
-        if (SubstringMatch(complete_text, item.label)) {
-          //std::cerr << "!! emitting " << item.label << std::endl;
+        if (item.label.find(complete_text) != std::string::npos) {
+          // Don't insert the same completion entry.
+          if (!inserted.insert(item.InsertedContent()).second) {
+            std::cerr << "foo " << item.InsertedContent();
+            continue;
+          }
+
           filtered_result.push_back(item);
           if (filtered_result.size() >= kMaxResultSize)
             break;
+        }
+      }
+
+      if (filtered_result.size() < kMaxResultSize) {
+        for (const lsCompletionItem& item : complete_response->result.items) {
+          if (SubstringMatch(complete_text, item.label)) {
+            // Don't insert the same completion entry.
+            if (!inserted.insert(item.InsertedContent()).second)
+              continue;
+
+            filtered_result.push_back(item);
+            if (filtered_result.size() >= kMaxResultSize)
+              break;
+          }
         }
       }
 
@@ -1583,7 +1619,8 @@ bool QueryDbMainLoop(
       }
 
       case IpcId::TextDocumentCompletion: {
-        auto msg = static_cast<Ipc_TextDocumentComplete*>(message.get());
+        auto msg = std::shared_ptr<Ipc_TextDocumentComplete>(
+            static_cast<Ipc_TextDocumentComplete*>(message.release()));
 
         std::string path = msg->params.textDocument.uri.GetPath();
         WorkingFile* file = working_files->GetFileByFilename(path);
@@ -1632,8 +1669,8 @@ bool QueryDbMainLoop(
           std::cerr << "[complete] Got existing completion " << existing_completion;
 
           ClangCompleteManager::OnComplete callback = std::bind(
-            [working_files, global_code_complete_cache, non_global_code_complete_cache, is_global_completion, existing_completion]
-            (Ipc_TextDocumentComplete* msg, NonElidedVector<lsCompletionItem> results) {
+            [working_files, global_code_complete_cache, non_global_code_complete_cache, is_global_completion, existing_completion, msg]
+            (const NonElidedVector<lsCompletionItem>& results, bool is_cached_result) {
 
             Out_TextDocumentComplete complete_response;
             complete_response.id = msg->id;
@@ -1645,44 +1682,62 @@ bool QueryDbMainLoop(
             IpcManager::instance()->SendOutMessageToClient(IpcId::TextDocumentCompletion, complete_response);
 
             // Cache completion results.
-            std::string path = msg->params.textDocument.uri.GetPath();
-            if (is_global_completion) {
-              global_code_complete_cache->cached_path = path;
-              std::cerr << "[complete] Updating global_code_complete_cache->cached_results [0]" << std::endl;
-              global_code_complete_cache->cached_results = results;
+            if (!is_cached_result) {
+              std::string path = msg->params.textDocument.uri.GetPath();
+              if (is_global_completion) {
+                global_code_complete_cache->WithLock([&]() {
+                  global_code_complete_cache->cached_path_ = path;
+                  std::cerr << "[complete] Updating global_code_complete_cache->cached_results [0]" << std::endl;
+                  global_code_complete_cache->cached_results_ = results;
+                  std::cerr << "[complete] DONE Updating global_code_complete_cache->cached_results [0]" << std::endl;
+                });
+              }
+              else {
+                non_global_code_complete_cache->WithLock([&]() {
+                  non_global_code_complete_cache->cached_path_ = path;
+                  non_global_code_complete_cache->cached_completion_position_ = msg->params.position;
+                  std::cerr << "[complete] Updating non_global_code_complete_cache->cached_results [1]" << std::endl;
+                  non_global_code_complete_cache->cached_results_ = results;
+                  std::cerr << "[complete] DONE Updating non_global_code_complete_cache->cached_results [1]" << std::endl;
+                });
+              }
             }
-            else {
-              non_global_code_complete_cache->cached_path = path;
-              non_global_code_complete_cache->cached_completion_position = msg->params.position;
-              std::cerr << "[complete] Updating non_global_code_complete_cache->cached_results [1]" << std::endl;
-              non_global_code_complete_cache->cached_results = results;
-            }
+          }, std::placeholders::_1, std::placeholders::_2);
 
-            delete msg;
-          }, static_cast<Ipc_TextDocumentComplete*>(message.release()), std::placeholders::_1);
-
-          if (is_global_completion && global_code_complete_cache->cached_path == path && !global_code_complete_cache->cached_results.empty()) {
+          bool is_cache_match = false;
+          global_code_complete_cache->WithLock([&]() {
+            is_cache_match = is_global_completion && global_code_complete_cache->cached_path_ == path && !global_code_complete_cache->cached_results_.empty();
+          });
+          if (is_cache_match) {
             std::cerr << "[complete] Early-returning cached global completion results at " << msg->params.position.ToString() << std::endl;
 
             ClangCompleteManager::OnComplete freshen_global =
               [global_code_complete_cache]
-              (NonElidedVector<lsCompletionItem> results) {
+              (NonElidedVector<lsCompletionItem> results, bool is_cached_result) {
+
+              assert(!is_cached_result);
 
               std::cerr << "[complete] Updating global_code_complete_cache->cached_results [2]" << std::endl;
               // note: path is updated in the normal completion handler.
-              global_code_complete_cache->cached_results = results;
+              global_code_complete_cache->WithLock([&]() {
+                global_code_complete_cache->cached_results_ = results;
+              });
+              std::cerr << "[complete] DONE Updating global_code_complete_cache->cached_results [2]" << std::endl;
             };
-            clang_complete->CodeComplete(msg->params, std::move(freshen_global));
 
-            // Note: callback will delete the message (ie, |params|) so we need to run completion_manager->CodeComplete before |callback|.
-            callback(global_code_complete_cache->cached_results);
+            global_code_complete_cache->WithLock([&]() {
+              callback(global_code_complete_cache->cached_results_, true /*is_cached_result*/);
+            });
+            clang_complete->CodeComplete(msg->params, freshen_global);
           }
           else if (non_global_code_complete_cache->IsCacheValid(msg->params)) {
             std::cerr << "[complete] Using cached completion results at " << msg->params.position.ToString() << std::endl;
-            callback(non_global_code_complete_cache->cached_results);
+            non_global_code_complete_cache->WithLock([&]() {
+              callback(non_global_code_complete_cache->cached_results_, true /*is_cached_result*/);
+            });
           }
           else {
-            clang_complete->CodeComplete(msg->params, std::move(callback));
+            clang_complete->CodeComplete(msg->params, callback);
           }
         }
 
@@ -1704,7 +1759,9 @@ bool QueryDbMainLoop(
         if (search.empty())
           break;
 
-        ClangCompleteManager::OnComplete callback = std::bind([signature_cache](BaseIpcMessage* message, std::string search, int active_param, const NonElidedVector<lsCompletionItem>& results) {
+        ClangCompleteManager::OnComplete callback = std::bind(
+          [signature_cache]
+          (BaseIpcMessage* message, std::string search, int active_param, const NonElidedVector<lsCompletionItem>& results, bool is_cached_result) {
           auto msg = static_cast<Ipc_TextDocumentSignatureHelp*>(message);
           auto ipc = IpcManager::instance();
 
@@ -1742,17 +1799,23 @@ bool QueryDbMainLoop(
           ipc->SendOutMessageToClient(IpcId::TextDocumentSignatureHelp, response);
           timer.ResetAndPrint("[complete] Writing signature help results");
 
-          signature_cache->cached_path = msg->params.textDocument.uri.GetPath();
-          signature_cache->cached_completion_position = msg->params.position;
-          std::cerr << "[complete] Updating signature_cache->cached_results [3]" << std::endl;
-          signature_cache->cached_results = results;
+          if (!is_cached_result) {
+            signature_cache->WithLock([&]() {
+              signature_cache->cached_path_ = msg->params.textDocument.uri.GetPath();
+              signature_cache->cached_completion_position_ = msg->params.position;
+              std::cerr << "[complete] Updating signature_cache->cached_results [3]" << std::endl;
+              signature_cache->cached_results_ = results;
+            });
+          }
 
           delete message;
-        }, message.release(), search, active_param, std::placeholders::_1);
+        }, message.release(), search, active_param, std::placeholders::_1, std::placeholders::_2);
 
         if (signature_cache->IsCacheValid(params)) {
           std::cerr << "[complete] Using cached completion results at " << params.position.ToString() << std::endl;
-          callback(signature_cache->cached_results);
+          signature_cache->WithLock([&]() {
+            callback(signature_cache->cached_results_, true /*is_cached_result*/);
+          });
         }
         else {
           clang_complete->CodeComplete(params, std::move(callback));
@@ -2197,7 +2260,7 @@ bool QueryDbMainLoop(
               if (include_insert_strings.size() == 1)
                 command.title = "Insert " + *include_insert_strings.begin();
               else
-                command.title = "Pick one of " + std::to_string(include_insert_strings.size()) + " includes to insert";
+                command.title = "Pick one of " + std::to_string(command.arguments.edits.size()) + " includes to insert";
               command.command = "cquery._insertInclude";
               command.arguments.textDocumentUri = msg->params.textDocument.uri;
               response.result.push_back(command);
@@ -2309,7 +2372,13 @@ bool QueryDbMainLoop(
             if (var->def.is_local && !config->codeLensOnLocalVariables)
               continue;
 
-            AddCodeLens("ref", "refs", &common, ref.loc.OffsetStartColumn(0), var->uses, var->def.definition_spelling, true /*force_display*/);
+            bool force_display = true;
+            // Do not show 0 refs on macro with no uses, as it is most likely a
+            // header guard.
+            if (var->def.is_macro)
+              force_display = false;
+
+            AddCodeLens("ref", "refs", &common, ref.loc.OffsetStartColumn(0), var->uses, var->def.definition_spelling, force_display);
             break;
           }
           case SymbolKind::File:
@@ -2336,8 +2405,16 @@ bool QueryDbMainLoop(
           << " candidates for query " << msg->params.query << std::endl;
 
         std::string query = msg->params.query;
+
+        std::unordered_set<std::string> inserted_results;
+        inserted_results.reserve(config->maxWorkspaceSearchResults);
+
         for (int i = 0; i < db->detailed_names.size(); ++i) {
           if (db->detailed_names[i].find(query) != std::string::npos) {
+            // Do not show the same entry twice.
+            if (!inserted_results.insert(db->detailed_names[i]).second)
+              continue;
+
             InsertSymbolIntoResult(db, working_files, db->symbols[i], &response.result);
             if (response.result.size() >= config->maxWorkspaceSearchResults)
               break;
@@ -2347,6 +2424,10 @@ bool QueryDbMainLoop(
         if (response.result.size() < config->maxWorkspaceSearchResults) {
           for (int i = 0; i < db->detailed_names.size(); ++i) {
             if (SubstringMatch(query, db->detailed_names[i])) {
+              // Do not show the same entry twice.
+              if (!inserted_results.insert(db->detailed_names[i]).second)
+                continue;
+
               InsertSymbolIntoResult(db, working_files, db->symbols[i], &response.result);
               if (response.result.size() >= config->maxWorkspaceSearchResults)
                 break;
@@ -2444,9 +2525,9 @@ void QueryDbMain(Config* config, MultiQueueWaiter* waiter) {
       config, &project, &working_files,
       std::bind(&EmitDiagnostics, &working_files, std::placeholders::_1, std::placeholders::_2));
   IncludeComplete include_complete(config, &project);
-  CodeCompleteCache global_code_complete_cache;
-  CodeCompleteCache non_global_code_complete_cache;
-  CodeCompleteCache signature_cache;
+  auto global_code_complete_cache = MakeUnique<CodeCompleteCache>();
+  auto non_global_code_complete_cache = MakeUnique<CodeCompleteCache>();
+  auto signature_cache = MakeUnique<CodeCompleteCache>();
   FileConsumer::SharedState file_consumer_shared;
 
   // Run query db main loop.
@@ -2456,7 +2537,7 @@ void QueryDbMain(Config* config, MultiQueueWaiter* waiter) {
     bool did_work = QueryDbMainLoop(
         config, &db, waiter, &queue_do_index, &queue_do_id_map, &queue_on_id_mapped, &queue_on_indexed,
         &project, &file_consumer_shared, &working_files,
-        &clang_complete, &include_complete, &global_code_complete_cache, &non_global_code_complete_cache, &signature_cache);
+        &clang_complete, &include_complete, global_code_complete_cache.get(), non_global_code_complete_cache.get(), signature_cache.get());
     if (!did_work) {
       IpcManager* ipc = IpcManager::instance();
       waiter->Wait({
